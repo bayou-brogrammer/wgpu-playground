@@ -1,13 +1,2 @@
-[package]
-edition = "2021"
-name    = "gol_glass"
-version = "0.1.0"
-
-[dependencies]
-bytemuck = "1"
-glam     = "0.24"
-glass    = { git = "https://github.com/hakolao/glass", features = ["egui"] }
-
-env_logger = "0.10"
-log        = "0.4"
-regex      = "1"
+[workspace]
+members = ["run_wasm", "crates/*"]

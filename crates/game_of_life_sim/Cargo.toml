@@ -1,0 +1,15 @@
+[package]
+edition = "2021"
+name    = "game_of_life_sim"
+version = "0.1.0"
+
+[dependencies]
+bytemuck = "1"
+glam     = "0.24"
+glass    = { path = "../../../glass", features = ["egui"] }
+
+cfg-if     = "1"
+env_logger = "0.10"
+instant    = "0.1"
+log        = "0.4"
+regex      = "1"
