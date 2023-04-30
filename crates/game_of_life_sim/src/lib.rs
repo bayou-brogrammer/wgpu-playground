@@ -1,20 +1,22 @@
 mod camera;
 mod canvas_data;
 mod dsl;
+mod gameloop;
 mod pipelines;
 mod shaders;
 
-use camera::{CameraProjection, OrthographicCamera, CAMERA_MOVE_SPEED};
+use camera::CAMERA_MOVE_SPEED;
+use gameloop::Time;
 use instant::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use canvas_data::CanvasData;
-use glam::{Mat4, Quat, Vec2, Vec3};
+use glam::Vec2;
 use glass::{
     pipelines::QuadPipeline,
     wgpu,
     window::GlassWindow,
-    winit::{self, event::VirtualKeyCode},
+    winit::{self, dpi::PhysicalSize},
     GlassApp, GlassContext, RenderData,
 };
 use pipelines::Pipelines;
@@ -26,19 +28,13 @@ pub const SIM_SIZE: u32 = 1024;
 pub const WORK_GROUP_SIZE: u32 = 32;
 pub const FPS_60: f32 = 16.0 / 1000.0;
 
-#[rustfmt::skip]
-const OPENGL_TO_WGPU: glam::Mat4 = glam::Mat4::from_cols_array(&[
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.0,
-    0.0, 0.0, 0.5, 1.0,
-]);
-
 pub struct GameOfLifeApp {
+    time: Time,
     dt_sum: f32,
     num_dts: f32,
     count: usize,
-    time: Instant,
+
+    current_time: Instant,
     updated_time: Instant,
 
     drawing: bool,
@@ -46,6 +42,7 @@ pub struct GameOfLifeApp {
     prev_cursor_pos: Option<Vec2>,
 
     camera: camera::OrthographicCamera,
+    camera_controller: camera::CameraController,
 
     data: Option<CanvasData>,
     quad_pipeline: Option<QuadPipeline>,
@@ -56,18 +53,23 @@ pub struct GameOfLifeApp {
 
 impl Default for GameOfLifeApp {
     fn default() -> Self {
+        let mut camera = camera::OrthographicCamera::default();
+        camera.zoom_to_fit_pixels(SIM_SIZE, SIM_SIZE);
+
         Self {
             count: 0,
             dt_sum: 0.0,
             num_dts: 0.0,
-            time: Instant::now(),
+            time: Time::default(),
+            current_time: Instant::now(),
             updated_time: Instant::now(),
 
             drawing: false,
             prev_cursor_pos: None,
             cursor_pos: Default::default(),
 
-            camera: camera::OrthographicCamera::default(),
+            camera,
+            camera_controller: camera::CameraController::new(CAMERA_MOVE_SPEED),
 
             data: None,
             quad_pipeline: None,
@@ -79,11 +81,20 @@ impl Default for GameOfLifeApp {
 }
 
 impl GameOfLifeApp {
-    fn cursor_to_canvas(&self, width: f32, height: f32) -> (Vec2, Vec2) {
-        let half_screen = Vec2::new(width, height) / 2.0;
-        let current_canvas_pos = self.cursor_pos - half_screen + SIM_SIZE as f32 / 2.0;
-        let prev_canvas_pos = self.prev_cursor_pos.unwrap_or(current_canvas_pos) - half_screen
-            + SIM_SIZE as f32 / 2.0;
+    fn world_pos_to_canvas_pos(&self, world_pos: Vec2) -> Vec2 {
+        world_pos + Vec2::new(SIM_SIZE as f32 / 2.0, SIM_SIZE as f32 / 2.0)
+    }
+
+    fn cursor_to_canvas(&self, size: PhysicalSize<u32>) -> (Vec2, Vec2) {
+        let cursor_pos = self.cursor_pos;
+        let prev_cursor_pos = self.prev_cursor_pos.unwrap_or(self.cursor_pos);
+
+        // Convert mouse position to world position, then convert to canvas position
+        let current_canvas_pos =
+            self.world_pos_to_canvas_pos(self.camera.screen_to_world_pos(size, cursor_pos));
+        let prev_canvas_pos =
+            self.world_pos_to_canvas_pos(self.camera.screen_to_world_pos(size, prev_cursor_pos));
+
         (current_canvas_pos, prev_canvas_pos)
     }
 }
@@ -140,11 +151,59 @@ impl GlassApp for GameOfLifeApp {
     }
 }
 
+fn handle_inputs(app: &mut GameOfLifeApp, event: &winit::event::Event<()>) {
+    if let winit::event::Event::WindowEvent { event, .. } = event {
+        app.camera_controller.process_events(event);
+
+        match event {
+            winit::event::WindowEvent::CursorMoved { position, .. } => {
+                app.cursor_pos = Vec2::new(position.x as f32, position.y as f32);
+            }
+            winit::event::WindowEvent::MouseInput {
+                button: winit::event::MouseButton::Left,
+                state,
+                ..
+            } => {
+                app.drawing = state == &winit::event::ElementState::Pressed;
+            }
+            winit::event::WindowEvent::MouseWheel { delta, .. } => {
+                let mut x_scroll_diff = 0.0;
+                let mut y_scroll_diff = 0.0;
+
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                        x_scroll_diff += x;
+                        y_scroll_diff += y;
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(delta) => {
+                        // I just took this from three-rs, no idea why this magic number was chosen ¯\_(ツ)_/¯
+                        const PIXELS_PER_LINE: f64 = 38.0;
+
+                        y_scroll_diff += (delta.y / PIXELS_PER_LINE) as f32;
+                        x_scroll_diff += (delta.x / PIXELS_PER_LINE) as f32;
+                    }
+                }
+
+                if x_scroll_diff != 0.0 || y_scroll_diff != 0.0 {
+                    if y_scroll_diff < 0.0 {
+                        app.camera.zoom(1.05)
+                    } else {
+                        app.camera.zoom(1.0 / 1.05);
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
+}
+
 fn run_update(app: &mut GameOfLifeApp, context: &mut GlassContext) {
+    app.time.update();
+
     let now = Instant::now();
-    app.dt_sum += (now - app.time).as_secs_f32();
+    app.dt_sum += (now - app.current_time).as_secs_f32();
     app.num_dts += 1.0;
-    if app.num_dts == 100.0 {
+    if app.num_dts == 1000.0 {
         // Set fps
         context.primary_render_window().window().set_title(&format!(
             "Game Of Life: {:.2}",
@@ -153,7 +212,7 @@ fn run_update(app: &mut GameOfLifeApp, context: &mut GlassContext) {
         app.num_dts = 0.0;
         app.dt_sum = 0.0;
     }
-    app.time = Instant::now();
+    app.current_time = Instant::now();
 
     // Use only single command queue
     let mut encoder = context
@@ -162,16 +221,16 @@ fn run_update(app: &mut GameOfLifeApp, context: &mut GlassContext) {
             label: Some("Computes"),
         });
 
-    let (width, height) = {
-        let size = context.primary_render_window().window().inner_size();
-        (size.width as f32, size.height as f32)
-    };
-    app.camera.update(width, height);
+    // Update Camera
+    app.camera_controller.update_camera(
+        &mut app.camera,
+        context.primary_render_window().window().inner_size(),
+        app.time.delta_seconds(),
+    );
 
-    // Update 60fps
-    if (app.time - app.updated_time).as_secs_f32() > FPS_60 {
+    if (app.current_time - app.updated_time).as_secs_f32() > FPS_60 {
+        app.updated_time = app.current_time;
         update_game_of_life(app, context, &mut encoder);
-        app.updated_time = app.time;
     }
 
     if app.drawing {
@@ -188,6 +247,7 @@ fn run_update(app: &mut GameOfLifeApp, context: &mut GlassContext) {
 fn render(app: &mut GameOfLifeApp, render_data: RenderData) {
     let GameOfLifeApp {
         data,
+        camera,
         quad_pipeline,
         ..
     } = app;
@@ -218,71 +278,9 @@ fn render(app: &mut GameOfLifeApp, render_data: RenderData) {
             &mut rpass,
             &canvas_data.canvas_bind_group,
             [0.0; 4],
-            camera_projection(&app.camera).to_cols_array_2d(),
+            camera.world_to_screen().to_cols_array_2d(),
             canvas_data.canvas.size,
         );
-    }
-}
-
-fn handle_inputs(app: &mut GameOfLifeApp, event: &winit::event::Event<()>) {
-    if let winit::event::Event::WindowEvent { event, .. } = event {
-        match event {
-            winit::event::WindowEvent::CursorMoved { position, .. } => {
-                app.cursor_pos = Vec2::new(position.x as f32, position.y as f32);
-            }
-            winit::event::WindowEvent::MouseInput {
-                button: winit::event::MouseButton::Left,
-                state,
-                ..
-            } => {
-                app.drawing = state == &winit::event::ElementState::Pressed;
-            }
-            winit::event::WindowEvent::KeyboardInput { input, .. } => {
-                println!("{:?}", app.dt_sum);
-                if let Some(key) = input.virtual_keycode {
-                    // Move camera with arrows & WASD
-                    let up = key == VirtualKeyCode::W || key == VirtualKeyCode::Up;
-                    let down = key == VirtualKeyCode::S || key == VirtualKeyCode::Down;
-                    let left = key == VirtualKeyCode::A || key == VirtualKeyCode::Left;
-                    let right = key == VirtualKeyCode::D || key == VirtualKeyCode::Right;
-
-                    let x_axis = -(right as i8) + left as i8;
-                    let y_axis = -(up as i8) + down as i8;
-                    let mut move_delta = Vec2::new(x_axis as f32, y_axis as f32);
-                    if move_delta != Vec2::ZERO {
-                        move_delta /= move_delta.length();
-                        app.camera.translate(move_delta * 0.01 * CAMERA_MOVE_SPEED);
-                    }
-                }
-            }
-            winit::event::WindowEvent::MouseWheel { delta, .. } => {
-                // I just took this from three-rs, no idea why this magic number was chosen ¯\_(ツ)_/¯
-                const PIXELS_PER_LINE: f64 = 38.0;
-
-                let mut x_scroll_diff = 0.0;
-                let mut y_scroll_diff = 0.0;
-
-                match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        x_scroll_diff += x;
-                        y_scroll_diff += y;
-                    }
-                    winit::event::MouseScrollDelta::PixelDelta(delta) => {
-                        y_scroll_diff += (delta.y / PIXELS_PER_LINE) as f32;
-                        x_scroll_diff += (delta.x / PIXELS_PER_LINE) as f32;
-                    }
-                }
-
-                if x_scroll_diff != 0.0 || y_scroll_diff != 0.0 {
-                    if y_scroll_diff < 0.0 {
-                        app.camera.zoom(1.05)
-                    } else {
-                        app.camera.zoom(1.0 / 1.05);
-                    }
-                }
-            }
-            _ => (),
-        }
     }
 }
 
@@ -291,12 +289,7 @@ fn draw_game_of_life(
     context: &mut GlassContext,
     encoder: &mut wgpu::CommandEncoder,
 ) {
-    let (width, height) = {
-        let size = context.primary_render_window().window().inner_size();
-        (size.width as f32, size.height as f32)
-    };
-
-    let (end, start) = app.cursor_to_canvas(width, height);
+    let (end, start) = app.cursor_to_canvas(context.primary_render_window().window().inner_size());
     let GameOfLifeApp {
         data,
         draw_pipeline,
@@ -386,14 +379,6 @@ fn init_game_of_life(app: &mut GameOfLifeApp, context: &mut GlassContext) {
         cpass.dispatch_workgroups(SIM_SIZE / WORK_GROUP_SIZE, SIM_SIZE / WORK_GROUP_SIZE, 1);
     }
     context.queue().submit(Some(encoder.finish()));
-}
-
-// =============================== CAMERA =============================== //
-
-fn camera_projection(camera: &OrthographicCamera) -> glam::Mat4 {
-    OPENGL_TO_WGPU
-        * camera.ortho.get_projection_matrix()
-        * Mat4::from_scale_rotation_translation(Vec3::ONE, Quat::IDENTITY, camera.pos.extend(-10.0))
 }
 
 // =============================== MISC =============================== //

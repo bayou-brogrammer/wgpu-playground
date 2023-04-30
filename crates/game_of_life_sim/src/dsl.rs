@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 /**
  * An expression in the domain specific language we use to describe cellular automata. Expressions
  * can perform arbitrary arithmetic and comparisons between constants, a boolean that indicates
