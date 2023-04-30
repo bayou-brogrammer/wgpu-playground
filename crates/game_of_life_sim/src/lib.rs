@@ -1,19 +1,21 @@
-pub mod canvas_data;
-pub mod dsl;
-pub mod pipelines;
-pub mod shaders;
+mod camera;
+mod canvas_data;
+mod dsl;
+mod pipelines;
+mod shaders;
 
+use camera::{CameraProjection, OrthographicCamera, CAMERA_MOVE_SPEED};
 use instant::Instant;
 
 use bytemuck::{Pod, Zeroable};
 use canvas_data::CanvasData;
-use glam::Vec2;
+use glam::{Mat4, Quat, Vec2, Vec3};
 use glass::{
-    device_context::DeviceConfig,
     pipelines::QuadPipeline,
     wgpu,
-    window::{GlassWindow, WindowConfig},
-    winit, Glass, GlassApp, GlassConfig, GlassContext, GlassError, RenderData,
+    window::GlassWindow,
+    winit::{self, event::VirtualKeyCode},
+    GlassApp, GlassContext, RenderData,
 };
 use pipelines::Pipelines;
 
@@ -23,64 +25,6 @@ use wasm_bindgen::prelude::*;
 pub const SIM_SIZE: u32 = 1024;
 pub const WORK_GROUP_SIZE: u32 = 32;
 pub const FPS_60: f32 = 16.0 / 1000.0;
-
-fn config() -> GlassConfig {
-    GlassConfig {
-        device_config: DeviceConfig {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            features: wgpu::Features::PUSH_CONSTANTS
-                | wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-            limits: wgpu::Limits {
-                // Using 32 * 32 work group size
-                max_compute_invocations_per_workgroup: 1024,
-                ..wgpu::Limits::default()
-            },
-            backends: wgpu::Backends::all(),
-        },
-        window_configs: vec![WindowConfig {
-            width: SIM_SIZE,
-            height: SIM_SIZE,
-            exit_on_esc: true,
-            present_mode: wgpu::PresentMode::AutoNoVsync,
-            ..WindowConfig::default()
-        }],
-    }
-}
-
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
-pub fn run() {
-    cfg_if::cfg_if! {
-        if #[cfg(target_arch = "wasm32")] {
-            std::panic::set_hook(Box::new(console_error_panic_hook::hook));
-            console_log::init_with_level(log::Level::Info).expect("Couldn't initialize logger");
-        } else {
-            env_logger::builder()
-            .filter_level(log::LevelFilter::Info)
-            .filter(Some("wgpu"), log::LevelFilter::Error)
-            .filter(Some("naga"), log::LevelFilter::Error)
-            .build();
-        }
-    }
-
-    match Glass::new(GameOfLifeApp::default(), config()).run() {
-        Ok(_) => {}
-        Err(GlassError::AdapterError) => {
-            log::error!("Adapter Error");
-        }
-        Err(GlassError::WindowError(e)) => {
-            log::error!("Window Error: {}", e);
-        }
-        Err(GlassError::SurfaceError(e)) => {
-            log::error!("Surface Error: {}", e);
-        }
-        Err(GlassError::ImageError(e)) => {
-            log::error!("Image Error: {}", e);
-        }
-        Err(GlassError::DeviceError(e)) => {
-            log::error!("Device error: {}", e);
-        }
-    }
-}
 
 #[rustfmt::skip]
 const OPENGL_TO_WGPU: glam::Mat4 = glam::Mat4::from_cols_array(&[
@@ -101,6 +45,8 @@ pub struct GameOfLifeApp {
     cursor_pos: Vec2,
     prev_cursor_pos: Option<Vec2>,
 
+    camera: camera::OrthographicCamera,
+
     data: Option<CanvasData>,
     quad_pipeline: Option<QuadPipeline>,
     init_pipeline: Option<wgpu::ComputePipeline>,
@@ -120,6 +66,8 @@ impl Default for GameOfLifeApp {
             drawing: false,
             prev_cursor_pos: None,
             cursor_pos: Default::default(),
+
+            camera: camera::OrthographicCamera::default(),
 
             data: None,
             quad_pipeline: None,
@@ -151,46 +99,6 @@ impl GlassApp for GameOfLifeApp {
         _event_loop: &winit::event_loop::EventLoop<()>,
         context: &mut GlassContext,
     ) {
-        // #[cfg(target_arch = "wasm32")]
-        // {
-        //     use winit::platform::web::WindowExtWebSys;
-
-        //     let window = context.primary_render_window().window();
-        //     log::info!("canvas: {:?}", window);
-        //     // let canvas = window.canvas();
-
-        //     // let window = web_sys::window().unwrap();
-        //     // let document = window.document().unwrap();
-        //     // let body = document.body().unwrap();
-
-        //     // // Set a background color for the canvas to make it easier to tell where the canvas is for debugging purposes.
-        //     // canvas.style().set_css_text("background-color: crimson;");
-        //     // body.append_child(&canvas).unwrap();
-
-        //     // let log_header = document.create_element("h2").unwrap();
-        //     // log_header.set_text_content(Some("Event Log"));
-        //     // body.append_child(&log_header).unwrap();
-
-        //     // let log_list = document.create_element("ul").unwrap();
-        //     // body.append_child(&log_list).unwrap();
-
-        //     //     // Winit prevents sizing with CSS, so we have to set
-        //     //     // the size manually when on web.
-        //     //     use winit::dpi::PhysicalSize;
-        //     //     window.set_inner_size(PhysicalSize::new(450, 400));
-
-        //     //     use winit::platform::web::WindowExtWebSys;
-        //     //     web_sys::window()
-        //     //         .and_then(|win| win.document())
-        //     //         .and_then(|doc| {
-        //     //             let dst = doc.get_element_by_id("wasm-example")?;
-        //     //             let canvas = web_sys::Element::from(window.canvas());
-        //     //             dst.append_child(&canvas).ok()?;
-        //     //             Some(())
-        //     //         })
-        //     //         .expect("Couldn't append canvas to document body.");
-        // }
-
         // Create pipelines
         let Pipelines {
             init_pipeline,
@@ -254,6 +162,12 @@ fn run_update(app: &mut GameOfLifeApp, context: &mut GlassContext) {
             label: Some("Computes"),
         });
 
+    let (width, height) = {
+        let size = context.primary_render_window().window().inner_size();
+        (size.width as f32, size.height as f32)
+    };
+    app.camera.update(width, height);
+
     // Update 60fps
     if (app.time - app.updated_time).as_secs_f32() > FPS_60 {
         update_game_of_life(app, context, &mut encoder);
@@ -280,17 +194,7 @@ fn render(app: &mut GameOfLifeApp, render_data: RenderData) {
 
     let canvas_data = data.as_ref().unwrap();
     let quad_pipeline = quad_pipeline.as_ref().unwrap();
-    let RenderData {
-        encoder,
-        frame,
-        window,
-        ..
-    } = render_data;
-
-    let (width, height) = {
-        let size = window.window().inner_size();
-        (size.width as f32, size.height as f32)
-    };
+    let RenderData { encoder, frame, .. } = render_data;
 
     let view = frame
         .texture
@@ -304,7 +208,7 @@ fn render(app: &mut GameOfLifeApp, render_data: RenderData) {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                     store: true,
                 },
             })],
@@ -314,7 +218,7 @@ fn render(app: &mut GameOfLifeApp, render_data: RenderData) {
             &mut rpass,
             &canvas_data.canvas_bind_group,
             [0.0; 4],
-            camera_projection([width, height]).to_cols_array_2d(),
+            camera_projection(&app.camera).to_cols_array_2d(),
             canvas_data.canvas.size,
         );
     }
@@ -332,6 +236,50 @@ fn handle_inputs(app: &mut GameOfLifeApp, event: &winit::event::Event<()>) {
                 ..
             } => {
                 app.drawing = state == &winit::event::ElementState::Pressed;
+            }
+            winit::event::WindowEvent::KeyboardInput { input, .. } => {
+                println!("{:?}", app.dt_sum);
+                if let Some(key) = input.virtual_keycode {
+                    // Move camera with arrows & WASD
+                    let up = key == VirtualKeyCode::W || key == VirtualKeyCode::Up;
+                    let down = key == VirtualKeyCode::S || key == VirtualKeyCode::Down;
+                    let left = key == VirtualKeyCode::A || key == VirtualKeyCode::Left;
+                    let right = key == VirtualKeyCode::D || key == VirtualKeyCode::Right;
+
+                    let x_axis = -(right as i8) + left as i8;
+                    let y_axis = -(up as i8) + down as i8;
+                    let mut move_delta = Vec2::new(x_axis as f32, y_axis as f32);
+                    if move_delta != Vec2::ZERO {
+                        move_delta /= move_delta.length();
+                        app.camera.translate(move_delta * 0.01 * CAMERA_MOVE_SPEED);
+                    }
+                }
+            }
+            winit::event::WindowEvent::MouseWheel { delta, .. } => {
+                // I just took this from three-rs, no idea why this magic number was chosen ¯\_(ツ)_/¯
+                const PIXELS_PER_LINE: f64 = 38.0;
+
+                let mut x_scroll_diff = 0.0;
+                let mut y_scroll_diff = 0.0;
+
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                        x_scroll_diff += x;
+                        y_scroll_diff += y;
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(delta) => {
+                        y_scroll_diff += (delta.y / PIXELS_PER_LINE) as f32;
+                        x_scroll_diff += (delta.x / PIXELS_PER_LINE) as f32;
+                    }
+                }
+
+                if x_scroll_diff != 0.0 || y_scroll_diff != 0.0 {
+                    if y_scroll_diff < 0.0 {
+                        app.camera.zoom(1.05)
+                    } else {
+                        app.camera.zoom(1.0 / 1.05);
+                    }
+                }
             }
             _ => (),
         }
@@ -442,18 +390,10 @@ fn init_game_of_life(app: &mut GameOfLifeApp, context: &mut GlassContext) {
 
 // =============================== CAMERA =============================== //
 
-fn camera_projection(screen_size: [f32; 2]) -> glam::Mat4 {
-    let half_width = screen_size[0] / 2.0;
-    let half_height = screen_size[1] / 2.0;
+fn camera_projection(camera: &OrthographicCamera) -> glam::Mat4 {
     OPENGL_TO_WGPU
-        * glam::Mat4::orthographic_rh(
-            -half_width,
-            half_width,
-            -half_height,
-            half_height,
-            0.0,
-            1000.0,
-        )
+        * camera.ortho.get_projection_matrix()
+        * Mat4::from_scale_rotation_translation(Vec3::ONE, Quat::IDENTITY, camera.pos.extend(-10.0))
 }
 
 // =============================== MISC =============================== //

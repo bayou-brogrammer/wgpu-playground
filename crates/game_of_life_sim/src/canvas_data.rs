@@ -82,6 +82,12 @@ impl CanvasData {
             }],
         });
 
+        // let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        //     label: Some("Camera Buffer"),
+        //     contents: bytemuck::cast_slice(&[camera_uniform]),
+        //     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        // });
+
         CanvasData {
             canvas,
             data_in,

@@ -24,5 +24,8 @@ rustflags = ["-Zshare-generics=n"]
 #[profile.dev]
 #debug = 1
 
+[target.wasm32-unknown-unknown]
+runner = "wasm-server-runner"
+
 [alias]
-run-wasm = "run --release --package run_wasm --"
+run-wasm = "run --target wasm32-unknown-unknown --release"
